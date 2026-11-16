@@ -53,10 +53,7 @@ func TestStableServerKeepsItsURLAndReleasesItsDirectory(t *testing.T) {
 
 	stopped = true
 	require.NoError(t, server.Stop())
-	entries, err := os.ReadDir(directory)
-	require.NoError(t, err)
-	require.Len(t, entries, 1, "only the lock stays")
-	require.Equal(t, lockName, entries[0].Name())
+	require.NoDirExists(t, directory)
 }
 
 func TestHeldStableDirectoryFallsBackToANewOne(t *testing.T) {
@@ -71,7 +68,6 @@ func TestHeldStableDirectoryFallsBackToANewOne(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, claimed.release()) })
 
-	require.False(t, claimed.stable)
 	require.Regexp(t, `/i-[0-9]+$`, claimed.directory)
 }
 
@@ -84,10 +80,26 @@ func TestClaimClearsAStableDirectoryOfADeadProcess(t *testing.T) {
 	claimed, err := claim(state, "left")
 	require.NoError(t, err)
 
-	require.True(t, claimed.stable)
+	require.Equal(t, directory, claimed.directory)
 	require.NoDirExists(t, filepath.Join(directory, dataName))
 	require.NoError(t, claimed.release())
-	require.FileExists(t, filepath.Join(directory, lockName))
+	require.NoDirExists(t, directory)
+}
+
+// A sweep or a stop removes a directory while holding its lock; a claimer that opened the lock
+// file before then holds the lock of a file nobody else can find.
+func TestLockOfARemovedFileIsNoClaim(t *testing.T) {
+	path := filepath.Join(t.TempDir(), lockName)
+	lock, acquired, err := lockFile(path, true)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	t.Cleanup(func() { require.NoError(t, lock.Close()) })
+	require.True(t, stillLinked(lock, path))
+
+	require.NoError(t, os.Remove(path))
+	require.False(t, stillLinked(lock, path))
+	writeFile(t, path)
+	require.False(t, stillLinked(lock, path), "a new file under the same name is another lock")
 }
 
 func TestSweepRemovesOnlyTheDirectoriesOfDeadProcesses(t *testing.T) {
@@ -108,8 +120,7 @@ func TestSweepRemovesOnlyTheDirectoriesOfDeadProcesses(t *testing.T) {
 
 	require.NoDirExists(t, filepath.Join(state, "i-dead"))
 	require.DirExists(t, filepath.Join(state, "i-live", dataName), "a live process holds it")
-	require.NoDirExists(t, filepath.Join(state, "run-dead", dataName))
-	require.FileExists(t, filepath.Join(state, "run-dead", lockName), "a stable directory keeps its lock")
+	require.NoDirExists(t, filepath.Join(state, "run-dead"))
 	require.DirExists(t, filepath.Join(state, "i-foreign", dataName), "no lock: not a server directory")
 	require.DirExists(t, filepath.Join(state, "postgres-18.3.0", dataName), "not a server name")
 	require.FileExists(t, filepath.Join(state, "i-file"))
@@ -297,4 +308,20 @@ func TestFailedStartRemovesTheServerDirectory(t *testing.T) {
 	directories, globError := filepath.Glob(filepath.Join(state, uniquePrefix+"*"))
 	require.NoError(t, globError)
 	require.Empty(t, directories)
+}
+
+func TestUnusableStateDirectoryFailsTheClaim(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "a-file")
+	writeFile(t, state)
+
+	_, stableError := claim(state, "x")
+	_, newError := claim(state, "")
+	_, lockError := waitForLock(filepath.Join(state, unpackLockName))
+	_, acquired, missingError := lockFile(filepath.Join(t.TempDir(), "missing", lockName), true)
+
+	require.ErrorContains(t, stableError, "create the server directory")
+	require.ErrorContains(t, newError, "create the server directory")
+	require.ErrorContains(t, lockError, "open the lock")
+	require.ErrorIs(t, missingError, os.ErrNotExist)
+	require.False(t, acquired)
 }

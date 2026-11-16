@@ -194,6 +194,18 @@ func TestTemplateWithoutFingerprintLastsOneProcess(t *testing.T) {
 	require.False(t, onServer(t, template))
 }
 
+func TestDroppedTemplateFailsTheDatabase(t *testing.T) {
+	t.Parallel()
+	server := attached(t, "dropped", &Options{Migrate: Statements(schema), Fingerprint: "dropped"})
+	createAndDrop(t, server)
+	require.NoError(t, dropTemplate(t.Context(), primary.cluster.administration, server.template)) // by hand, or by a run a day later
+
+	_, err := server.createDatabase(t.Context())
+
+	require.ErrorContains(t, err, "copy the template")
+	require.ErrorContains(t, err, "does not exist")
+}
+
 func TestServersOfOnePackageBuildTheTemplateOnce(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32

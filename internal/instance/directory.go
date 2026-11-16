@@ -32,20 +32,42 @@ func claim(state, stable string) (*Instance, error) {
 	return claimNew(state)
 }
 
-// claimStable returns nil without an error when another process holds the directory.
+// claimStable returns nil without an error when another process holds the directory, or when a
+// stop or a sweep removed it between this process opening the lock and taking it: the lock then
+// belongs to a file nobody else can find, so the directory is not this process's.
 func claimStable(directory string) (*Instance, error) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, fmt.Errorf("create the server directory: %w", err)
 	}
-	lock, acquired, err := lockFile(filepath.Join(directory, lockName), true)
-	if err != nil || !acquired {
+	path := filepath.Join(directory, lockName)
+	lock, acquired, err := lockFile(path, true)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil //nolint:nilnil // removed after MkdirAll: no directory to claim, the caller takes a new one
+		}
 		return nil, err
+	}
+	if !acquired {
+		return nil, nil //nolint:nilnil // another process holds it: the caller takes a new one
+	}
+	if !stillLinked(lock, path) {
+		_ = lock.Close() // the lock of a removed file protects nothing
+		return nil, nil  //nolint:nilnil // no directory to claim: the caller takes a new one
 	}
 	stopOrphan(directory)
 	if err := clearDirectory(directory); err != nil {
 		return nil, errors.Join(fmt.Errorf("clear the server directory: %w", err), lock.Close())
 	}
-	return &Instance{directory: directory, lock: lock, stable: true}, nil
+	return &Instance{directory: directory, lock: lock}, nil
+}
+
+func stillLinked(lock *os.File, path string) bool {
+	held, err := lock.Stat()
+	if err != nil {
+		return false
+	}
+	current, err := os.Stat(path)
+	return err == nil && os.SameFile(held, current)
 }
 
 // claimNew creates the directory under a name the sweep ignores, takes its lock and only then
@@ -80,8 +102,7 @@ func Sweep(state string) {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		stable := strings.HasPrefix(name, stablePrefix)
-		if !entry.IsDir() || !stable && !strings.HasPrefix(name, uniquePrefix) {
+		if !entry.IsDir() || !strings.HasPrefix(name, stablePrefix) && !strings.HasPrefix(name, uniquePrefix) {
 			continue
 		}
 		directory := filepath.Join(state, name)
@@ -90,12 +111,8 @@ func Sweep(state string) {
 			continue // in use, or no lock file: not one of ours
 		}
 		stopOrphan(directory)
-		if stable {
-			_ = clearDirectory(directory) // the next claim of the directory clears it again
-		} else {
-			_ = os.RemoveAll(directory) // a leftover directory is harmless and swept again next time
-		}
-		_ = lock.Close() // closing releases the lock; nothing was written to it
+		_ = os.RemoveAll(directory) // a leftover directory is harmless and swept again next time
+		_ = lock.Close()            // closing releases the lock; nothing was written to it
 	}
 }
 

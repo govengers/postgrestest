@@ -71,7 +71,6 @@ type Instance struct {
 	directory string
 	binaries  string
 	lock      *os.File
-	stable    bool
 }
 
 // DefaultStateDirectory is postgrestest below embedded-postgres' own archive cache,
@@ -129,7 +128,7 @@ func (i *Instance) URL() string {
 // Directory is the server's directory.
 func (i *Instance) Directory() string { return i.directory }
 
-// Stop stops the server at once, removes what it wrote and releases the directory.
+// Stop stops the server at once, removes its directory and releases it.
 func (i *Instance) Stop() error {
 	var stopError error
 	if _, err := os.Stat(filepath.Join(i.directory, dataName, "postmaster.pid")); err == nil {
@@ -138,14 +137,10 @@ func (i *Instance) Stop() error {
 	return errors.Join(stopError, i.release())
 }
 
+// release removes the directory while it still holds the lock, so no other process can claim it
+// in between; a claimer that opened the lock file before sees it unlinked and takes a new one.
 func (i *Instance) release() error {
-	var removeError error
-	if i.stable {
-		removeError = clearDirectory(i.directory)
-	} else {
-		removeError = os.RemoveAll(i.directory)
-	}
-	return errors.Join(removeError, i.lock.Close()) // closing the file releases the lock
+	return errors.Join(os.RemoveAll(i.directory), i.lock.Close()) // closing the file releases the lock
 }
 
 func (i *Instance) run(ctx context.Context) error {
