@@ -128,10 +128,10 @@ func TestStopOrphanSignalsOnlyTheServerOfItsDirectory(t *testing.T) {
 	server := startProcess(t, data)
 	writePostmasterPID(t, data, server.Process.Pid)
 	require.True(t, runsFrom(server.Process.Pid, data))
+	exited := make(chan error, 1)
+	go func() { exited <- server.Wait() }() // reaps it, as init reaps a real orphan: Linux still signals a zombie
 	stopOrphan(filepath.Dir(data))
 
-	exited := make(chan error, 1)
-	go func() { exited <- server.Wait() }()
 	select {
 	case err := <-exited:
 		require.ErrorContains(t, err, "signal: quit")
