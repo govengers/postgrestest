@@ -27,46 +27,53 @@ const EnvironmentVariable = "POSTGRESTEST_URL"
 const cleanupTimeout = 30 * time.Second
 
 // ErrClosed is returned, through the test's failure, by a Server used after Close.
-var ErrClosed = errors.New("postgrestest: server closed")
+var ErrClosed = errors.New("the server is closed")
 
 // Options configure a Server. The zero value gives every test an empty database.
 type Options struct {
-	// Migrate builds the template every test database is cloned from, on a connection to the
+	// Migrate builds the template every test database is copied from, on a connection to the
 	// fresh template database. It runs once per server and fingerprint, before the first test
 	// database. nil leaves the template empty. Statements returns a Migrate for SQL texts.
 	Migrate func(ctx context.Context, connection *pgx.Conn) error
 	// Fingerprint identifies what Migrate builds, for example the migration SQL itself or
 	// FingerprintFS of the migration files. A template with the same fingerprint that is already on
-	// the server, left by an earlier run against the same POSTGRESTEST_URL, is reused; a new
-	// fingerprint builds a new template and drops the older ones of the package. Empty means the
-	// template is built for this process only and dropped by Close.
+	// the server, left by an earlier run against the same POSTGRESTEST_URL, is reused. Empty means
+	// the template is built for this process only and dropped by Close.
 	Fingerprint string
 }
 
-// Server is the PostgreSQL of one test binary. It starts on the first Database call: it attaches
-// to the server POSTGRESTEST_URL names, or else starts an embedded PostgreSQL 18 that only this
-// process uses. Main stops it after the tests. A Server is safe for concurrent use, so tests that
-// call t.Parallel share it.
+// Server hands out the test databases of one template on the PostgreSQL of one test binary. The
+// PostgreSQL starts on the first Database call: the binary attaches to the server
+// POSTGRESTEST_URL names, or else starts an embedded PostgreSQL 18 that only it uses. Main stops it
+// after the tests. A Server is safe for concurrent use, so tests that call t.Parallel share it.
 type Server struct {
+	cluster     *cluster
 	migrate     func(ctx context.Context, connection *pgx.Conn) error
 	fingerprint string
 	scope       string // identifies the package on a shared server; part of every database name
-	address     string // overrides POSTGRESTEST_URL; set by this package's tests only
 
-	mutex          sync.Mutex
-	started        bool
-	startError     error
-	closed         bool
-	embedded       *instance.Instance // nil when attached to POSTGRESTEST_URL
-	base           *url.URL           // the maintenance database
-	administration *pgxpool.Pool
-	template       string // the built template, empty until the first Database
+	mutex    sync.Mutex
+	template string // the built template, empty until the first Database
+}
+
+// cluster is the PostgreSQL the Servers of one test binary share.
+type cluster struct {
+	address string // overrides POSTGRESTEST_URL; set by this package's tests only
+
+	mutex            sync.Mutex
+	started          bool
+	startError       error
+	closed           bool
+	embedded         *instance.Instance // nil when attached to POSTGRESTEST_URL
+	base             *url.URL           // the maintenance database
+	administration   *pgxpool.Pool
+	processTemplates []string // templates without a fingerprint, dropped by close
 }
 
 // New returns a Server that starts when a test first asks for a database. It reads nothing and
 // starts nothing before that. A nil options means the zero Options.
 //
-// One Server per test binary, kept in a package variable and passed to TestMain:
+// One Server per test binary, kept in a package variable and closed by TestMain:
 //
 //	var postgres = postgrestest.New(&postgrestest.Options{
 //		Migrate:     postgrestest.Statements(store.MigrationV1),
@@ -75,10 +82,21 @@ type Server struct {
 //
 //	func TestMain(m *testing.M) { goleak.VerifyTestMain(postgres.Main(m)) }
 func New(options *Options) *Server {
+	return newServer(&cluster{}, options)
+}
+
+// WithTemplate returns a Server on the same PostgreSQL whose test databases copy another template,
+// for the tests that need other migrations than the rest (an upgrade from an older schema, for
+// example). The two share one start and one stop: Main or Close of either closes both.
+func (s *Server) WithTemplate(options *Options) *Server {
+	return newServer(s.cluster, options)
+}
+
+func newServer(shared *cluster, options *Options) *Server {
 	if options == nil {
 		options = &Options{}
 	}
-	return &Server{migrate: options.Migrate, fingerprint: options.Fingerprint, scope: packageScope()}
+	return &Server{cluster: shared, migrate: options.Migrate, fingerprint: options.Fingerprint, scope: packageScope()}
 }
 
 // packageScope is a digest of the working directory, which go test sets to the package's
@@ -133,11 +151,11 @@ func (s *Server) Database(tb testing.TB) string {
 	tb.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
-		if err := dropDatabase(ctx, s.administration, name); err != nil {
+		if err := dropDatabase(ctx, s.cluster.administration, name); err != nil {
 			tb.Errorf("postgrestest: %v", err)
 		}
 	})
-	return s.databaseURL(name)
+	return s.cluster.databaseURL(name)
 }
 
 // Pool returns a pgx pool on a new database for this test (see Database) with pgx's default
@@ -153,28 +171,35 @@ func (s *Server) Pool(tb testing.TB) *pgxpool.Pool {
 	return pool
 }
 
-// Close drops the template when it was built for this process only, closes the server's
-// connections and stops the embedded server. Close of a Server that never started does nothing.
-// After Close, Database fails the test with ErrClosed.
+// Close drops the templates built for this process only, closes the server's connections and
+// stops the embedded server, for this Server and every one that shares its PostgreSQL through
+// WithTemplate. Close of a Server that never started does nothing. After Close, Database fails the
+// test with ErrClosed.
 func (s *Server) Close() error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	if s.closed {
+	return s.cluster.close()
+}
+
+func (c *cluster) close() error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.closed {
 		return nil
 	}
-	s.closed = true
-	if !s.started || s.startError != nil {
+	c.closed = true
+	if !c.started || c.startError != nil {
 		return nil
 	}
 	var errs []error
-	if s.fingerprint == "" && s.embedded == nil && s.template != "" {
+	if c.embedded == nil { // an embedded server takes its templates with it
 		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
-		errs = append(errs, dropTemplate(ctx, s.administration, s.template))
+		for _, template := range c.processTemplates {
+			errs = append(errs, dropTemplate(ctx, c.administration, template))
+		}
 	}
-	s.administration.Close()
-	if s.embedded != nil {
-		errs = append(errs, s.embedded.Stop())
+	c.administration.Close()
+	if c.embedded != nil {
+		errs = append(errs, c.embedded.Stop())
 	}
 	if err := errors.Join(errs...); err != nil {
 		return fmt.Errorf("postgrestest: close: %w", err)
@@ -182,22 +207,24 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// start attaches to POSTGRESTEST_URL or starts the embedded server, once; the caller holds the
-// mutex. The start is not bound to the first test's context: every later test needs it too.
-func (s *Server) start(ctx context.Context) error {
-	if s.closed {
+// start attaches to POSTGRESTEST_URL or starts the embedded server, once. The start is not bound
+// to the first test's context: every later test needs it too.
+func (c *cluster) start(ctx context.Context) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.closed {
 		return ErrClosed
 	}
-	if s.started {
-		return s.startError
+	if c.started {
+		return c.startError
 	}
-	s.started = true
-	s.startError = s.connect(context.WithoutCancel(ctx))
-	return s.startError
+	c.started = true
+	c.startError = c.connect(context.WithoutCancel(ctx))
+	return c.startError
 }
 
-func (s *Server) connect(ctx context.Context) error {
-	address := s.address
+func (c *cluster) connect(ctx context.Context) error {
+	address := c.address
 	if address == "" {
 		address = os.Getenv(EnvironmentVariable)
 	}
@@ -206,12 +233,12 @@ func (s *Server) connect(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("start the embedded PostgreSQL: %w", err)
 		}
-		s.embedded = embedded
+		c.embedded = embedded
 		address = embedded.URL()
 	}
 	base, err := parseURL(address)
 	if err != nil {
-		return errors.Join(err, s.stopEmbedded())
+		return errors.Join(err, c.stopEmbedded())
 	}
 	administration, err := pgxpool.New(ctx, address)
 	if err == nil {
@@ -221,18 +248,25 @@ func (s *Server) connect(ctx context.Context) error {
 		if administration != nil {
 			administration.Close()
 		}
-		return errors.Join(fmt.Errorf("connect to %s: %w", base.Redacted(), err), s.stopEmbedded())
+		return errors.Join(fmt.Errorf("connect to %s: %w", base.Redacted(), err), c.stopEmbedded())
 	}
-	s.base = base
-	s.administration = administration
+	c.base = base
+	c.administration = administration
 	return nil
 }
 
-func (s *Server) stopEmbedded() error {
-	if s.embedded == nil {
+func (c *cluster) stopEmbedded() error {
+	if c.embedded == nil {
 		return nil
 	}
-	return s.embedded.Stop()
+	return c.embedded.Stop()
+}
+
+// addProcessTemplate records a template close drops.
+func (c *cluster) addProcessTemplate(name string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.processTemplates = append(c.processTemplates, name)
 }
 
 // parseURL accepts postgres:// and postgresql:// URLs; keyword/value strings cannot name another
@@ -245,8 +279,8 @@ func parseURL(address string) (*url.URL, error) {
 	return parsed, nil
 }
 
-func (s *Server) databaseURL(name string) string {
-	address := *s.base
+func (c *cluster) databaseURL(name string) string {
+	address := *c.base
 	address.Path = "/" + name
 	address.RawPath = ""
 	return address.String()

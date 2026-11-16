@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -25,9 +27,14 @@ const (
 	buildSuffix         = "build"
 )
 
+// unusedTemplateAge is how long a fingerprinted template stays on a shared server after its last
+// use: long enough for every run that may still copy it, short enough that templates of edited
+// migrations do not pile up.
+const unusedTemplateAge = 24 * time.Hour
+
 // SQLSTATE codes the template handling reacts to.
 const (
-	invalidCatalogName      = "3D000" // CREATE DATABASE ... TEMPLATE of a template that is gone
+	invalidCatalogName      = "3D000" // a database that is gone
 	objectInUse             = "55006" // a database still has sessions
 	advisoryLockNamespace   = "postgrestest template "
 	randomSuffixLength      = 8
@@ -60,13 +67,7 @@ func (s *Server) createDatabase(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	err = cloneDatabase(ctx, s.administration, name, template)
-	if hasCode(err, invalidCatalogName) {
-		// a run of the same package with other migrations dropped the template: build it again and
-		// copy it while still holding the build lock, so that run cannot drop it in between
-		err = s.rebuildAndClone(ctx, name)
-	}
-	if err != nil {
+	if err := cloneDatabase(ctx, s.cluster.administration, name, template); err != nil {
 		return "", err
 	}
 	return name, nil
@@ -74,11 +75,11 @@ func (s *Server) createDatabase(ctx context.Context) (string, error) {
 
 // ensureTemplate starts the server and builds the template once; parallel tests wait for it.
 func (s *Server) ensureTemplate(ctx context.Context) (string, error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	if err := s.start(ctx); err != nil {
+	if err := s.cluster.start(ctx); err != nil {
 		return "", err
 	}
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	if s.template != "" {
 		return s.template, nil
 	}
@@ -87,29 +88,36 @@ func (s *Server) ensureTemplate(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if err := s.underBuildLock(ctx, func(connection *pgxpool.Conn) error {
-		return s.buildTemplate(ctx, connection, name)
+		return s.prepareTemplate(ctx, connection, name)
 	}); err != nil {
 		return "", err
+	}
+	if s.fingerprint == "" {
+		s.cluster.addProcessTemplate(name)
 	}
 	s.template = name
 	return name, nil
 }
 
-func (s *Server) rebuildAndClone(ctx context.Context, name string) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return s.underBuildLock(ctx, func(connection *pgxpool.Conn) error {
-		if err := s.buildTemplate(ctx, connection, s.template); err != nil {
-			return err
-		}
-		return cloneDatabase(ctx, connection, name, s.template)
-	})
+// prepareTemplate builds the template unless the server has it already, and for a fingerprinted
+// one records the use and drops the package's templates nobody used for a day: built for
+// migrations the package no longer has. A run of the same package with other migrations, in this
+// checkout at the same time, keeps its template.
+func (s *Server) prepareTemplate(ctx context.Context, connection *pgxpool.Conn, name string) error {
+	if err := s.buildTemplate(ctx, connection, name); err != nil || s.fingerprint == "" {
+		return err
+	}
+	used := time.Now().UTC()
+	if _, err := connection.Exec(ctx, "COMMENT ON DATABASE "+identifier(name)+" IS "+literal(used.Format(time.RFC3339))); err != nil {
+		return fmt.Errorf("record the use of the template: %w", err)
+	}
+	return s.dropUnusedTemplates(ctx, connection, used.Add(-unusedTemplateAge))
 }
 
 // underBuildLock runs build holding the package's advisory lock on the server, so test binaries
 // of one package that share a server build and drop their templates one at a time.
 func (s *Server) underBuildLock(ctx context.Context, build func(connection *pgxpool.Conn) error) error {
-	connection, err := s.administration.Acquire(ctx)
+	connection, err := s.cluster.administration.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("connect to the server: %w", err)
 	}
@@ -156,14 +164,14 @@ func (s *Server) buildTemplate(ctx context.Context, connection *pgxpool.Conn, na
 	if _, err := connection.Exec(ctx, "ALTER DATABASE "+identifier(name)+" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false"); err != nil {
 		return fmt.Errorf("mark the template: %w", err)
 	}
-	return s.dropOlderTemplates(ctx, connection, name)
+	return nil
 }
 
 func (s *Server) runMigrate(ctx context.Context, database string) error {
 	if s.migrate == nil {
 		return nil
 	}
-	connection, err := pgx.Connect(ctx, s.databaseURL(database))
+	connection, err := pgx.Connect(ctx, s.cluster.databaseURL(database))
 	if err != nil {
 		return fmt.Errorf("connect to the template: %w", err)
 	}
@@ -175,20 +183,27 @@ func (s *Server) runMigrate(ctx context.Context, database string) error {
 	return closeError
 }
 
-// dropOlderTemplates drops the fingerprinted templates of the package other than keep: they were
-// built for migrations the package no longer has.
-func (s *Server) dropOlderTemplates(ctx context.Context, connection *pgxpool.Conn, keep string) error {
-	rows, err := connection.Query(ctx, "SELECT datname FROM pg_database WHERE datistemplate AND starts_with(datname, $1) AND datname <> $2",
-		s.name(fingerprintKind), keep)
+// dropUnusedTemplates drops the package's fingerprinted templates last used before the cutoff,
+// and those without a readable record of their use.
+func (s *Server) dropUnusedTemplates(ctx context.Context, connection *pgxpool.Conn, cutoff time.Time) error {
+	rows, err := connection.Query(ctx, `SELECT datname, coalesce(shobj_description(oid, 'pg_database'), '') FROM pg_database
+		WHERE datistemplate AND starts_with(datname, $1)`, s.name(fingerprintKind))
 	if err != nil {
-		return fmt.Errorf("list older templates: %w", err)
+		return fmt.Errorf("list the templates: %w", err)
 	}
-	older, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	type template struct{ name, used string }
+	templates, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (template, error) {
+		var found template
+		return found, row.Scan(&found.name, &found.used)
+	})
 	if err != nil {
-		return fmt.Errorf("list older templates: %w", err)
+		return fmt.Errorf("list the templates: %w", err)
 	}
-	for _, template := range older {
-		if err := dropTemplate(ctx, connection, template); err != nil {
+	for _, found := range templates {
+		if used, err := time.Parse(time.RFC3339, found.used); err == nil && !used.Before(cutoff) {
+			continue
+		}
+		if err := dropTemplate(ctx, connection, found.name); err != nil {
 			return err
 		}
 	}
@@ -254,6 +269,9 @@ func (s *Server) lockKey() int64 {
 }
 
 func identifier(name string) string { return pgx.Identifier{name}.Sanitize() }
+
+// literal quotes a string constant for the statements that take no parameters.
+func literal(text string) string { return "'" + strings.ReplaceAll(text, "'", "''") + "'" }
 
 func hasCode(err error, code string) bool {
 	var postgresError *pgconn.PgError
