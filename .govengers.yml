@@ -1,3 +1,7 @@
 # govengers/standards profile (README "Profiles"). Every exception names the rule and why.
 profile: library
-exceptions: []
+exceptions:
+  - rule: DES-003
+    reason: A package's tests keep their one postgrestest.Server in a package variable, here and in every consumer (the documented usage). TestMain has no other channel to the tests, and a server per test is the slow path TST-002 steers away from. Test code only; the library itself has no package state that is written.
+  - rule: LIB-003
+    reason: Server.Main's Run writes a failed Close to standard error. It runs as the test binary's TestMain, where standard error is the channel go test reports, and the exit code alone would not say why the run failed.
