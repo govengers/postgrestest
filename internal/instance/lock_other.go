@@ -12,3 +12,5 @@ var errUnsupported = errors.New("postgrestest runs embedded servers on Unix-like
 func lockFile(string, bool) (*os.File, bool, error) { return nil, false, errUnsupported }
 
 func waitForLock(string) (*os.File, error) { return nil, errUnsupported }
+
+func privateDirectory(string) error { return errUnsupported }

@@ -24,50 +24,30 @@ const (
 // taken belongs to nobody, and a server still running in it is an orphan.
 func claim(state, stable string) (*Instance, error) {
 	if stable != "" {
-		instance, err := claimStable(filepath.Join(state, stablePrefix+stable))
-		if instance != nil || err != nil {
-			return instance, err
+		// held by another process or not usable: a new directory still serves, with another URL
+		if instance, err := claimStable(filepath.Join(state, stablePrefix+stable)); err == nil && instance != nil {
+			return instance, nil
 		}
 	}
 	return claimNew(state)
 }
 
-// claimStable returns nil without an error when another process holds the directory, or when a
-// stop or a sweep removed it between this process opening the lock and taking it: the lock then
-// belongs to a file nobody else can find, so the directory is not this process's.
+// claimStable returns nil without an error when another process holds the directory. Nothing
+// removes a stable directory or its lock file (release and Sweep only empty it), so the lock of
+// the file is the lock of the directory.
 func claimStable(directory string) (*Instance, error) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, fmt.Errorf("create the server directory: %w", err)
 	}
-	path := filepath.Join(directory, lockName)
-	lock, acquired, err := lockFile(path, true)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil //nolint:nilnil // removed after MkdirAll: no directory to claim, the caller takes a new one
-		}
-		return nil, err
-	}
-	if !acquired {
-		return nil, nil //nolint:nilnil // another process holds it: the caller takes a new one
-	}
-	if !stillLinked(lock, path) {
-		_ = lock.Close() // the lock of a removed file protects nothing
-		return nil, nil  //nolint:nilnil // no directory to claim: the caller takes a new one
+	lock, acquired, err := lockFile(filepath.Join(directory, lockName), true)
+	if err != nil || !acquired {
+		return nil, err // nil, nil: another process holds it
 	}
 	stopOrphan(directory)
 	if err := clearDirectory(directory); err != nil {
 		return nil, errors.Join(fmt.Errorf("clear the server directory: %w", err), lock.Close())
 	}
-	return &Instance{directory: directory, lock: lock}, nil
-}
-
-func stillLinked(lock *os.File, path string) bool {
-	held, err := lock.Stat()
-	if err != nil {
-		return false
-	}
-	current, err := os.Stat(path)
-	return err == nil && os.SameFile(held, current)
+	return &Instance{directory: directory, stable: true, lock: lock}, nil
 }
 
 // claimNew creates the directory under a name the sweep ignores, takes its lock and only then
@@ -90,8 +70,11 @@ func claimNew(state string) (*Instance, error) {
 }
 
 // Sweep stops the servers of processes that died without stopping them (a killed test binary, a
-// test timeout) and removes their files. It skips every directory whose lock a live process
-// holds, so the servers of other test runs and other checkouts stay untouched.
+// test timeout) and removes their files: the whole directory of a new one, everything but the
+// lock of a stable one (see claimStable). It skips every directory whose lock a live process
+// holds, so the servers of other test runs and other checkouts stay untouched. A new directory's
+// name is never reused, so a sweeper that takes the lock of one another sweeper removed meanwhile
+// removes nothing of anybody's.
 //
 // shortcut: a process that dies between creating a directory and renaming it leaves an empty
 // .new- directory behind; sweep them by age if they ever pile up.
@@ -111,8 +94,12 @@ func Sweep(state string) {
 			continue // in use, or no lock file: not one of ours
 		}
 		stopOrphan(directory)
-		_ = os.RemoveAll(directory) // a leftover directory is harmless and swept again next time
-		_ = lock.Close()            // closing releases the lock; nothing was written to it
+		if strings.HasPrefix(name, stablePrefix) {
+			_ = clearDirectory(directory) // a leftover is harmless and swept again next time
+		} else {
+			_ = os.RemoveAll(directory) // a leftover is harmless and swept again next time
+		}
+		_ = lock.Close() // closing releases the lock; nothing was written to it
 	}
 }
 

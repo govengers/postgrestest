@@ -47,3 +47,17 @@ func waitForLock(path string) (*os.File, error) {
 	}
 	return file, nil
 }
+
+// privateDirectory fails unless path is a directory, not a link, of the current user that only
+// that user can enter.
+func privateDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	owner, ok := info.Sys().(*syscall.Stat_t)
+	if !info.IsDir() || info.Mode().Perm()&0o077 != 0 || !ok || int(owner.Uid) != os.Getuid() {
+		return errors.New("not a private directory of the current user")
+	}
+	return nil
+}

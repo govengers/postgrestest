@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -20,15 +21,22 @@ import (
 
 func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
 
-// The one embedded server of this package's tests: a stable directory, as the launcher uses.
+// The one embedded server of this package's tests: a stable directory, as the launcher uses, in a
+// state directory with a space in its path (a home directory like /Users/Jane Doe), on the
+// binaries of the default one.
 func TestStableServerKeepsItsURLAndReleasesItsDirectory(t *testing.T) {
-	state, err := DefaultStateDirectory()
+	defaultState, err := DefaultStateDirectory()
 	require.NoError(t, err)
-	stable := "instance-test-" + strconv.Itoa(os.Getpid())
-	directory := filepath.Join(state, stablePrefix+stable)
-	t.Cleanup(func() { _ = os.RemoveAll(directory) }) // a unique name per run; nothing else uses it
+	binaries, err := unpackedBinaries(t.Context(), defaultState)
+	require.NoError(t, err)
+	state, err := os.MkdirTemp("/tmp", "postgrestest test-") //nolint:usetesting // t.TempDir is too long a path for a Unix socket on macOS
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(state)) })
+	require.NoError(t, os.Symlink(binaries, filepath.Join(state, filepath.Base(binaries))))
+	directory := filepath.Join(state, stablePrefix+"instance-test")
+	t.Setenv("PGPORT", "5433") // the server's socket is .s.PGSQL.5432 whatever the environment says
 
-	server, err := Start(t.Context(), &Options{Stable: stable})
+	server, err := Start(t.Context(), &Options{StateDirectory: state, Stable: "instance-test"})
 	require.NoError(t, err)
 	stopped := false
 	t.Cleanup(func() {
@@ -38,7 +46,7 @@ func TestStableServerKeepsItsURLAndReleasesItsDirectory(t *testing.T) {
 	})
 
 	require.Equal(t, directory, server.Directory())
-	require.Equal(t, "postgres://postgres@/postgres?host="+url.QueryEscape(directory)+"&sslmode=disable", server.URL())
+	require.Equal(t, "postgres://postgres@/postgres?host="+strings.ReplaceAll(url.QueryEscape(directory), "+", "%20")+"&port=5432&sslmode=disable", server.URL())
 	connection, err := pgx.Connect(t.Context(), server.URL())
 	require.NoError(t, err)
 	var fsync string
@@ -53,7 +61,8 @@ func TestStableServerKeepsItsURLAndReleasesItsDirectory(t *testing.T) {
 
 	stopped = true
 	require.NoError(t, server.Stop())
-	require.NoDirExists(t, directory)
+	require.NoDirExists(t, filepath.Join(directory, dataName))
+	require.FileExists(t, filepath.Join(directory, lockName), "the next claimer locks the same file")
 }
 
 func TestHeldStableDirectoryFallsBackToANewOne(t *testing.T) {
@@ -67,8 +76,13 @@ func TestHeldStableDirectoryFallsBackToANewOne(t *testing.T) {
 	claimed, err := claim(state, "busy")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, claimed.release()) })
+	writeFile(t, filepath.Join(state, stablePrefix+"file"))
+	unusable, err := claim(state, "file")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, unusable.release()) })
 
 	require.Regexp(t, `/i-[0-9]+$`, claimed.directory)
+	require.Regexp(t, `/i-[0-9]+$`, unusable.directory, "a stable directory that cannot be claimed")
 }
 
 func TestClaimClearsAStableDirectoryOfADeadProcess(t *testing.T) {
@@ -82,24 +96,33 @@ func TestClaimClearsAStableDirectoryOfADeadProcess(t *testing.T) {
 
 	require.Equal(t, directory, claimed.directory)
 	require.NoDirExists(t, filepath.Join(directory, dataName))
+	writeFile(t, filepath.Join(directory, logName))
 	require.NoError(t, claimed.release())
-	require.NoDirExists(t, directory)
+	require.NoFileExists(t, filepath.Join(directory, logName))
+	require.FileExists(t, filepath.Join(directory, lockName))
 }
 
-// A sweep or a stop removes a directory while holding its lock; a claimer that opened the lock
-// file before then holds the lock of a file nobody else can find.
-func TestLockOfARemovedFileIsNoClaim(t *testing.T) {
-	path := filepath.Join(t.TempDir(), lockName)
-	lock, acquired, err := lockFile(path, true)
+// A claimer that opened the lock file of a stable directory while another process released it
+// gets the directory once the other lets go: the file is never replaced.
+func TestReleasedStableDirectoryKeepsItsLockFile(t *testing.T) {
+	state := t.TempDir()
+	first, err := claim(state, "x")
 	require.NoError(t, err)
-	require.True(t, acquired)
-	t.Cleanup(func() { require.NoError(t, lock.Close()) })
-	require.True(t, stillLinked(lock, path))
+	waiting, err := os.Open(filepath.Join(first.directory, lockName))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, waiting.Close()) })
 
-	require.NoError(t, os.Remove(path))
-	require.False(t, stillLinked(lock, path))
-	writeFile(t, path)
-	require.False(t, stillLinked(lock, path), "a new file under the same name is another lock")
+	require.NoError(t, first.release())
+	second, err := claim(state, "x")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, second.release()) })
+
+	opened, err := waiting.Stat()
+	require.NoError(t, err)
+	held, err := second.lock.Stat()
+	require.NoError(t, err)
+	require.Equal(t, first.directory, second.directory)
+	require.True(t, os.SameFile(opened, held))
 }
 
 func TestSweepRemovesOnlyTheDirectoriesOfDeadProcesses(t *testing.T) {
@@ -120,7 +143,8 @@ func TestSweepRemovesOnlyTheDirectoriesOfDeadProcesses(t *testing.T) {
 
 	require.NoDirExists(t, filepath.Join(state, "i-dead"))
 	require.DirExists(t, filepath.Join(state, "i-live", dataName), "a live process holds it")
-	require.NoDirExists(t, filepath.Join(state, "run-dead"))
+	require.NoDirExists(t, filepath.Join(state, "run-dead", dataName))
+	require.FileExists(t, filepath.Join(state, "run-dead", lockName), "a stable directory keeps its lock file")
 	require.DirExists(t, filepath.Join(state, "i-foreign", dataName), "no lock: not a server directory")
 	require.DirExists(t, filepath.Join(state, "postgres-18.3.0", dataName), "not a server name")
 	require.FileExists(t, filepath.Join(state, "i-file"))
@@ -279,11 +303,23 @@ func TestFailedCommandReturnsTheLog(t *testing.T) {
 	require.Contains(t, logTail(filepath.Join(t.TempDir(), "missing")), "no server log")
 }
 
-func TestTooLongSocketPathFailsTheStart(t *testing.T) {
+func TestTooDeepDirectoryPutsTheSocketBelowTmp(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "a-directory-name-that-makes-the-socket-path-longer-than-unix-allows-by-a-wide-margin")
-	server := &Instance{directory: directory}
+	short, err := socketDirectory(directory)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(short)) })
 
-	require.ErrorContains(t, server.run(t.Context()), "longer than the 103 bytes")
+	again, err := socketDirectory(directory)
+
+	require.NoError(t, err)
+	require.Equal(t, short, again, "a stable directory keeps its URL")
+	require.Regexp(t, `^/tmp/postgrestest-[0-9a-f]{16}$`, short)
+	shallow, err := socketDirectory("/tmp/shallow")
+	require.NoError(t, err)
+	require.Equal(t, "/tmp/shallow", shallow)
+	require.NoError(t, os.Chmod(short, 0o755)) //nolint:gosec // G302: the open directory the check must refuse
+	_, err = socketDirectory(directory)
+	require.ErrorContains(t, err, "not a private directory")
 }
 
 func writeFile(t *testing.T, path string) {

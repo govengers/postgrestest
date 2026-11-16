@@ -5,12 +5,16 @@ package instance
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
@@ -32,9 +36,10 @@ const (
 	socketName    = ".s.PGSQL.5432"
 	startTimeout  = "60" // seconds pg_ctl waits for the server to accept connections
 	logTailLength = 4096
-	// maximumSocketPath is the longest Unix socket path PostgreSQL accepts on macOS (sun_path is
-	// 104 bytes there, 108 on Linux, both with the terminating NUL).
-	maximumSocketPath = 103
+	// shortSocketParent holds the socket of a server whose directory is too deep for one; not
+	// os.TempDir, which is deep itself on macOS and would make TMPDIR a test cache input.
+	shortSocketParent = "/tmp"
+	shortSocketPrefix = "postgrestest-"
 )
 
 // settings tune the server for tests: nothing is flushed to disk (a crash loses the server, which
@@ -66,9 +71,12 @@ type Options struct {
 }
 
 // Instance is one running embedded server. Its directory holds the lock its process keeps for as
-// long as the server runs, the data directory, the log and the socket.
+// long as the server runs, the data directory, the log and, unless its path is too long, the
+// socket.
 type Instance struct {
 	directory string
+	stable    bool   // a stable directory keeps its lock file, see release
+	socket    string // the socket's directory, set by run
 	binaries  string
 	lock      *os.File
 }
@@ -114,13 +122,15 @@ func Start(ctx context.Context, options *Options) (*Instance, error) {
 }
 
 // URL is the connection URL of the server's postgres database, for the superuser postgres over the
-// Unix socket; the server trusts every local connection.
+// Unix socket; the server trusts every local connection. The port names the socket file, so
+// PGPORT cannot point a client at another one.
 func (i *Instance) URL() string {
+	query := url.Values{"host": {i.socket}, "port": {strconv.Itoa(socketPort)}, "sslmode": {"disable"}}.Encode()
 	address := url.URL{
 		Scheme:   "postgres",
 		User:     url.User(superuser),
 		Path:     "/postgres",
-		RawQuery: url.Values{"host": {i.directory}, "sslmode": {"disable"}}.Encode(),
+		RawQuery: strings.ReplaceAll(query, "+", "%20"), // libpq and pgx read + as itself; Encode escapes a real + as %2B
 	}
 	return address.String()
 }
@@ -137,22 +147,33 @@ func (i *Instance) Stop() error {
 	return errors.Join(stopError, i.release())
 }
 
-// release removes the directory while it still holds the lock, so no other process can claim it
-// in between; a claimer that opened the lock file before sees it unlinked and takes a new one.
+// release empties the directory while it still holds the lock, so no other process can claim it
+// in between. A stable directory keeps its lock file: a claimer that opened it meanwhile gets the
+// lock of the same file, and so the directory, once this process lets go.
 func (i *Instance) release() error {
-	return errors.Join(os.RemoveAll(i.directory), i.lock.Close()) // closing the file releases the lock
+	var removeError error
+	if i.stable {
+		removeError = clearDirectory(i.directory)
+	} else {
+		removeError = os.RemoveAll(i.directory)
+	}
+	if i.socket != "" && i.socket != i.directory {
+		removeError = errors.Join(removeError, os.RemoveAll(i.socket))
+	}
+	return errors.Join(removeError, i.lock.Close()) // closing the file releases the lock
 }
 
 func (i *Instance) run(ctx context.Context) error {
-	socket := filepath.Join(i.directory, socketName)
-	if len(socket) > maximumSocketPath {
-		return fmt.Errorf("the socket path %s is longer than the %d bytes PostgreSQL accepts: use a shorter home directory", socket, maximumSocketPath)
+	socket, err := socketDirectory(i.directory)
+	if err != nil {
+		return err
 	}
+	i.socket = socket
 	data := filepath.Join(i.directory, dataName)
 	if err := i.command(ctx, "initdb", "-D", data, "-U", superuser, "-A", "trust", "-E", "UTF8", "--locale=C", "--no-sync", "--no-instructions"); err != nil {
 		return err
 	}
-	if err := appendSettings(filepath.Join(data, "postgresql.conf"), i.directory); err != nil {
+	if err := appendSettings(filepath.Join(data, "postgresql.conf"), i.socket); err != nil {
 		return err
 	}
 	return i.pgControl(ctx, "start", "-w", "-t", startTimeout, "-D", data, "-l", filepath.Join(i.directory, logName))
@@ -189,12 +210,43 @@ func appendSettings(configuration, socketDirectory string) error {
 		return fmt.Errorf("open postgresql.conf: %w", err)
 	}
 	lines := append([]string{"", "# postgrestest"}, settings...)
-	lines = append(lines, "unix_socket_directories = "+quoteSetting(socketDirectory), "")
+	// a list of directories: double quotes keep a comma or a space in the path
+	lines = append(lines, "unix_socket_directories = "+quoteSetting(`"`+strings.ReplaceAll(socketDirectory, `"`, `""`)+`"`), "")
 	_, writeError := file.WriteString(strings.Join(lines, "\n"))
 	if err := errors.Join(writeError, file.Close()); err != nil {
 		return fmt.Errorf("write postgresql.conf: %w", err)
 	}
 	return nil
+}
+
+// socketDirectory is directory when the socket path fits the platform's limit, else a directory of
+// this user below /tmp named after a digest of directory, so a stable directory keeps its URL.
+//
+// shortcut: the sweep does not remove the short socket directory of a dead process's server; the
+// next server of a stable directory reuses it, /tmp is cleared at boot.
+func socketDirectory(directory string) (string, error) {
+	if len(filepath.Join(directory, socketName)) <= maximumSocketPath() {
+		return directory, nil
+	}
+	digest := sha256.Sum256([]byte(directory))
+	short := filepath.Join(shortSocketParent, shortSocketPrefix+hex.EncodeToString(digest[:8]))
+	if err := os.Mkdir(short, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", fmt.Errorf("create the socket directory: %w", err)
+	}
+	// the server trusts whoever reaches the socket: a directory another user made would let them in
+	if err := privateDirectory(short); err != nil {
+		return "", fmt.Errorf("the socket directory %s: %w", short, err)
+	}
+	return short, nil
+}
+
+// maximumSocketPath is the longest Unix socket path PostgreSQL accepts: sun_path is 108 bytes on
+// Linux and 104 on macOS and the BSDs, with the terminating NUL.
+func maximumSocketPath() int {
+	if runtime.GOOS == "linux" {
+		return 107
+	}
+	return 103
 }
 
 // quoteSetting quotes a string value of postgresql.conf.
