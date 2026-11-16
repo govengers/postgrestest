@@ -44,8 +44,9 @@ type Options struct {
 	Migrate func(ctx context.Context, connection *pgx.Conn) error
 	// Fingerprint identifies what Migrate builds, for example the migration SQL itself or
 	// FingerprintFS of the migration files. A template with the same fingerprint that is already on
-	// the server, left by an earlier run against the same POSTGRESTEST_URL, is reused. Empty means
-	// the template is built for this process only and dropped by Close.
+	// the server, left by an earlier run against the same POSTGRESTEST_URL, is reused. It changes
+	// nothing on an embedded or launcher server, which is new in every run. Empty means the
+	// template is built for this process only and dropped by Close.
 	Fingerprint string
 }
 

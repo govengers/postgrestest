@@ -80,8 +80,8 @@ func removeUnpackLeftovers(state string) {
 }
 
 // unpack unpacks the archive in embedded-postgres' cache, downloading it first when it is missing,
-// with the system tar: about 2 s, where the library's pure Go xz decoder takes 30 to 60 s inside a
-// -race test binary. Without a usable tar, or when the download did not land where expected, the
+// with the system tar: 5.4 s measured in a -race test binary, where the library's pure Go xz
+// decoder took 26.9 s. Without a usable tar, or when the download did not land where expected, the
 // library unpacks.
 func unpack(ctx context.Context, scratch, unpacked string) error {
 	archive, err := archivePath()

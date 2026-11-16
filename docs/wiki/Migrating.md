@@ -53,6 +53,16 @@ M-series Mac (18 cores), macOS, Go 1.27.4, PostgreSQL 18.3, 16.11.2026, other ag
 | Where the binaries live | OS temp dir (jobs, events, wide-event-logger, livewire) or `~/.embedded-postgres-go` (auth, aikido) | `~/.embedded-postgres-go/postgrestest`, restored by CI |
 | Per test | schema plus migrations per test | copy 19.5 ms plus drop 9.3 ms (7.8 MB template, `STRATEGY FILE_COPY`) |
 
+Parallel tests in several packages at once (P15): six packages of 40 `t.Parallel` tests, each `Pool(t)` plus 20 inserts, `go test -count=1 ./...`, same Mac, load average 4 to 16 from other workloads:
+
+| Run | Copies and drops unbounded | At most two per test binary |
+|-----|----------------------------|------------------------------|
+| A server per test binary | 60.5 s, 76.7 s | 6.3 s, 6.9 s |
+| Through the launcher | 59 s (review measurement) | 7 s, 7 s |
+| One package of the six | - | 2.2 s |
+
+Unbounded, each binary ran up to as many `CREATE DATABASE` / `DROP DATABASE` statements at once as the machine has cores; each forces checkpoints, and the review saw 18 packages through the launcher fail with drop timeouts. Not measured on Linux.
+
 govengers/jobs at `cc58bc6`, `go test -race -count=1 ./...`, wall clock, switched locally to the wrapper above (not committed to jobs):
 
 | Run | Before | After |

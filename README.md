@@ -28,7 +28,7 @@ func TestCreate(t *testing.T) {
 ```
 
 - `Pool(t)` returns a pgx pool on a new database; `Database(t)` returns its URL, for a pool of your own or a process the test starts. Both are safe with `t.Parallel`.
-- `Options.Migrate` builds the template once per server: `Statements(texts...)` for SQL constants, or a function of your own (goose, for example) on the `*pgx.Conn` it gets. `Options.Fingerprint` lets a long-lived server reuse the template; `FingerprintFS` digests an `embed.FS` of migrations.
+- `Options.Migrate` builds the template once per server: `Statements(texts...)` for SQL constants, or a function of your own (goose, for example) on the `*pgx.Conn` it gets. `Options.Fingerprint` lets a long-lived server (an external `POSTGRESTEST_URL`) reuse the template; embedded and launcher servers are new in every run and build it every run whatever the fingerprint. `FingerprintFS` digests an `embed.FS` of migrations.
 - `WithTemplate(options)` gives some tests other migrations on the same server.
 - `Main(m)` closes the server after the tests, before goleak looks for leaks.
 

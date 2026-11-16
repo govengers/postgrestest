@@ -27,7 +27,7 @@
 //
 //	go run github.com/govengers/postgrestest/cmd/postgrestest go test -race ./...
 //
-// An embedded server listens on a Unix socket only, trusts local connections, keeps nothing on
+// An embedded server listens on a Unix socket only, trusts local connections, keeps no data on
 // disk after it stops and runs with fsync, synchronous commit, full-page writes, autovacuum and
 // JIT off, UTC as its time zone and 500 connections. The binaries are unpacked once per machine
 // into ~/.embedded-postgres-go/postgrestest, next to the archive embedded-postgres downloads, with
@@ -40,9 +40,13 @@
 // Every test database is a copy of the template (CREATE DATABASE ... TEMPLATE), dropped when the
 // test ends, so tests may call t.Parallel and leave whatever they like behind. The template is
 // built by Options.Migrate once per server. On a server that outlives the test binary (one that
-// POSTGRESTEST_URL names), a template built for the same Options.Fingerprint is reused, and
-// templates of older fingerprints are dropped. Database settings made with ALTER DATABASE ... SET
-// are not copied by PostgreSQL; set them on the connection or the pool instead.
+// POSTGRESTEST_URL names), a template built for the same Options.Fingerprint is reused, and the
+// package's templates nobody used for a day are dropped by its next run. An embedded or launcher
+// server is new in every run, so there the fingerprint changes nothing. A failed build fails every
+// later test of the binary at once. At most two copies and drops of one test binary run at a time:
+// many at once from the parallel tests of several packages slow the server far below its rate one
+// after another. Database settings made with ALTER DATABASE ... SET are not copied by PostgreSQL;
+// set them on the connection or the pool instead.
 //
 // # The Go test cache
 //

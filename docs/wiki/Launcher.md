@@ -10,7 +10,7 @@ test *flags:
 ```
 
 - It runs the command with `POSTGRESTEST_URL` set, stops the server when the command ends and exits with the command's status (2 without a command, 1 when the launcher fails).
-- The server's socket lives in `~/.embedded-postgres-go/postgrestest/run-<digest of the working directory>`, so the URL is the same in every run of one checkout and `go test` keeps replaying cached results (see [Test cache](Test-Cache.md)).
+- The server's socket lives in `~/.embedded-postgres-go/postgrestest/run-<digest of the working directory>` (or a `/tmp/postgrestest-<digest>` of it for a very deep home directory), so the URL is the same in every run of one checkout and `go test` keeps replaying cached results (see [Test cache](Test-Cache.md)).
 - A second launcher in the same checkout while the first runs gets a directory of its own; its results miss the cache once.
 - With `POSTGRESTEST_URL` already set, it runs the command against that server and starts nothing.
 - Ctrl-C and SIGTERM reach the command; the launcher waits for it and then stops the server. A launcher that is killed leaves its server behind; the next start of any postgrestest server on the machine stops it.

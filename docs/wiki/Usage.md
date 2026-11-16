@@ -26,7 +26,7 @@ func TestCreate(t *testing.T) {
 
 `Options.Migrate` runs once per server on a connection to the fresh template database. `Statements(texts...)` runs each text in a transaction of its own, like goose runs a migration file. A Migrate of your own can do anything with the connection; close every other connection it opens, or the template cannot be published.
 
-`Options.Fingerprint` identifies what Migrate builds. It matters on a server that outlives the test binary (one `POSTGRESTEST_URL` names): a template with the same fingerprint is reused, a new fingerprint builds a new one, and the package's templates nobody used for a day are dropped. Use the SQL itself for constants (`Fingerprint: MigrationV1 + MigrationV2`) or `FingerprintFS(migrations)` for an `embed.FS`. Empty means a template for this process only, dropped by `Close`.
+`Options.Fingerprint` identifies what Migrate builds. It matters only on a server that outlives the test run (an external one `POSTGRESTEST_URL` names); an embedded server and the launcher's are new in every run, so every run builds the template, fingerprint or not (tens of milliseconds for the govengers libraries). On a long-lived server a template with the same fingerprint is reused, a new fingerprint builds a new one, and the package's templates nobody used for a day are dropped. Use the SQL itself for constants (`Fingerprint: MigrationV1 + MigrationV2`) or `FingerprintFS(migrations)` for an `embed.FS`. Empty means a template for this process only, dropped by `Close`.
 
 ## goose
 
