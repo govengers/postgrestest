@@ -9,6 +9,14 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
+)
+
+// An orphan's immediate shutdown takes milliseconds; the bound only keeps a stuck process from
+// blocking the start.
+const (
+	orphanExitTimeout = 10 * time.Second
+	orphanExitPoll    = 10 * time.Millisecond
 )
 
 // claim returns a server directory this process holds the lock of: the stable one when it is
@@ -91,7 +99,8 @@ func Sweep(state string) {
 	}
 }
 
-// stopOrphan sends the immediate-shutdown signal to the server of directory, if one still runs.
+// stopOrphan stops the server of directory, if one still runs, with the immediate-shutdown signal
+// and waits for it to exit, so a new server can take over the directory's socket.
 func stopOrphan(directory string) {
 	data := filepath.Join(directory, dataName)
 	content, err := os.ReadFile(filepath.Join(data, "postmaster.pid")) //nolint:gosec // G304: a file of a server directory of this package
@@ -102,8 +111,14 @@ func stopOrphan(directory string) {
 	if err != nil || !runsFrom(processID, data) {
 		return
 	}
-	if process, err := os.FindProcess(processID); err == nil {
-		_ = process.Signal(syscall.SIGQUIT) // gone already is fine
+	process, err := os.FindProcess(processID)
+	if err != nil || process.Signal(syscall.SIGQUIT) != nil {
+		return // gone already
+	}
+	for deadline := time.Now().Add(orphanExitTimeout); time.Now().Before(deadline); time.Sleep(orphanExitPoll) {
+		if process.Signal(syscall.Signal(0)) != nil {
+			return
+		}
 	}
 }
 

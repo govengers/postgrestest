@@ -171,16 +171,56 @@ func TestCompleteBinariesAreNotUnpackedAgain(t *testing.T) {
 	require.NoFileExists(t, filepath.Join(state, unpackLockName), "the fast path takes no lock")
 }
 
-func TestUntarUnpacksACompleteArchiveOnly(t *testing.T) {
+// A home directory whose embedded-postgres cache holds a small archive of empty programs: the
+// unpack path runs in milliseconds and without a download.
+func TestBinariesAreUnpackedOnceFromTheCachedArchive(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	archive, err := archivePath()
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(archive), 0o700))
+	writeArchive(t, archive, "bin")
+	state, err := DefaultStateDirectory()
+	require.NoError(t, err)
+	writeFile(t, filepath.Join(state, unpackingName+"killed", "bin", "initdb"))
+
+	results := make(chan string, 2)
+	for range 2 {
+		go func() {
+			binaries, err := unpackedBinaries(context.Background(), state)
+			if err != nil {
+				binaries = err.Error()
+			}
+			results <- binaries
+		}()
+	}
+
+	final := filepath.Join(state, binariesPrefix+string(Version))
+	require.Equal(t, final, <-results)
+	require.Equal(t, final, <-results)
+	require.True(t, complete(final))
+	leftovers, err := filepath.Glob(filepath.Join(state, unpackingName+"*"))
+	require.NoError(t, err)
+	require.Empty(t, leftovers, "the scratch directories of this and of a killed unpack are gone")
+}
+
+// writeArchive packs the empty programs, or only the given members of bin, into an xz tarball.
+func writeArchive(t *testing.T, archive string, members ...string) {
+	t.Helper()
 	source := t.TempDir()
 	for _, program := range programs {
 		writeFile(t, filepath.Join(source, "bin", program))
 	}
+	arguments := append([]string{"-cJf", archive, "-C", source}, members...)
+	require.NoError(t, exec.CommandContext(t.Context(), "tar", arguments...).Run())
+}
+
+func TestUntarUnpacksACompleteArchiveOnly(t *testing.T) {
 	archives := t.TempDir()
 	complete := filepath.Join(archives, "complete.txz")
-	require.NoError(t, exec.CommandContext(t.Context(), "tar", "-cJf", complete, "-C", source, "bin").Run())
+	writeArchive(t, complete, "bin")
 	incomplete := filepath.Join(archives, "incomplete.txz")
-	require.NoError(t, exec.CommandContext(t.Context(), "tar", "-cJf", incomplete, "-C", source, "bin/initdb").Run())
+	writeArchive(t, incomplete, "bin/initdb")
 	target := filepath.Join(t.TempDir(), "binaries")
 
 	require.Error(t, untar(t.Context(), filepath.Join(archives, "missing.txz"), target))
@@ -239,4 +279,22 @@ func writeFile(t *testing.T, path string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
 	require.NoError(t, os.WriteFile(path, nil, 0o600))
+}
+
+func TestFailedStartRemovesTheServerDirectory(t *testing.T) {
+	state, err := os.MkdirTemp("/tmp", "postgrestest-") //nolint:usetesting // t.TempDir is too long a path for a Unix socket on macOS
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(state)) })
+	binaries := filepath.Join(state, binariesPrefix+string(Version), "bin")
+	for _, program := range programs {
+		require.NoError(t, os.MkdirAll(binaries, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(binaries, program), []byte("#!/bin/sh\necho "+program+" is broken\nexit 1\n"), 0o700)) //nolint:gosec // G306: a program the test runs
+	}
+
+	_, err = Start(t.Context(), &Options{StateDirectory: state})
+
+	require.ErrorContains(t, err, "initdb is broken")
+	directories, globError := filepath.Glob(filepath.Join(state, uniquePrefix+"*"))
+	require.NoError(t, globError)
+	require.Empty(t, directories)
 }

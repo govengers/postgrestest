@@ -6,7 +6,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 gotestsum := "go run gotest.tools/gotestsum@v1.13.0"
 govulncheck := "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0"
 coverage_threshold := "80"
-coverage_excluded := "/examples/|/test/"
+coverage_excluded := "/cmd/|/test/"
 e2e_inputs := "test/e2e"
 
 default:
@@ -15,8 +15,10 @@ default:
 # Vet and lint with the govengers baseline (.golangci.yml, copied from govengers/standards, LIB-005 checks enabled)
 lint:
     go vet ./...
-    go vet -tags e2e ./test/e2e/...
+    go vet -tags e2e ./test/e2e/
+    go vet -tags e2efixture ./test/e2e/fixture/...
     golangci-lint run ./...
+    golangci-lint run --build-tags e2efixture ./test/e2e/fixture/...
 
 # Unit tests of changed and affected packages; the Go test cache replays the rest (TST-014). Fails below the coverage threshold (TST-010)
 test *flags:
@@ -29,15 +31,16 @@ test *flags:
 # Every unit test, uncached and shuffled: the nightly run and before a release (TST-014, TST-005)
 test-all: (test "-count=1" "-shuffle=on")
 
-# Reproducible compiled suite: its hash says whether the suite has anything new to test (TST-015)
+# Reproducible launcher and compiled suite: their hash says whether the suite has anything new to test (TST-015)
 e2e-build:
     mkdir -p sandbox/e2e-build
-    go test -c -race -tags e2e -trimpath -buildvcs=false -o sandbox/e2e-build/ ./test/e2e/...
+    go build -race -trimpath -buildvcs=false -o sandbox/e2e-build/postgrestest ./cmd/postgrestest
+    go test -c -race -tags e2e -trimpath -buildvcs=false -o sandbox/e2e-build/ ./test/e2e/
 
-# The end-to-end suite against the public API with real collaborators, always (TST-011)
+# The end-to-end suite: go test on the fixture packages, on their own and through the launcher, and the server lifecycle around them, always (TST-011)
 test-e2e-all: e2e-build
     mkdir -p sandbox
-    {{gotestsum}} --format testname --jsonfile sandbox/e2e.json -- -race -tags e2e -trimpath -buildvcs=false -count=1 ./test/e2e/...
+    E2E_BINARY={{justfile_directory()}}/sandbox/e2e-build/postgrestest {{gotestsum}} --format testname --jsonfile sandbox/e2e.json -- -race -tags e2e -trimpath -buildvcs=false -count=1 ./test/e2e/
 
 # The end-to-end suite, skipped when suite and inputs equal a green run (TST-015); keeps sandbox/e2e.json for CI badges
 test-e2e: e2e-build
