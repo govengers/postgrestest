@@ -1,0 +1,20 @@
+# govengers/postgrestest
+
+> Fast PostgreSQL for Go tests: postgrestest.New(&Options{Migrate, Fingerprint}) returns a Server whose Pool(t) / Database(t) give every test its own database, copied (CREATE DATABASE ... TEMPLATE) from a template built once by Migrate and dropped after the test; an embedded PostgreSQL 18 per test binary on a Unix socket (binaries unpacked once per machine with the system tar into ~/.embedded-postgres-go/postgrestest), one server per test run through the launcher cmd/postgrestest, or an external server from POSTGRESTEST_URL; orphaned servers of dead processes swept, live ones of other checkouts untouched; every test input stable so the Go test cache keeps hitting.
+
+- Module: `github.com/govengers/postgrestest`, Go 1.26, Apache 2.0. Dependencies: pgx v5, embedded-postgres.
+- Package `postgrestest`: New, Options (Migrate, Fingerprint), Server (Database, Pool, Main, Close, WithTemplate), Statements, FingerprintFS, EnvironmentVariable (`POSTGRESTEST_URL`), ErrClosed, TestingM.
+- Command `cmd/postgrestest command...`: one server for the run, `POSTGRESTEST_URL` set for the command, exit status passed through.
+- Standards: govengers/standards, `library` profile.
+- Rules of thumb: one Server per test package in a package variable, `TestMain` is `goleak.VerifyTestMain(postgres.Main(m))`; Migrate must close every connection it opens; Fingerprint = the migration SQL or FingerprintFS(embed.FS); ALTER DATABASE SET is not copied to test databases; scope pg_locks/pg_stat_activity polls to current_database(); start the launcher the same way every time (go run changes PATH, a test cache input).
+
+## Docs
+
+- [README.md](README.md): overview, install, usage, modes, cache.
+- [docs/wiki/Home.md](docs/wiki/Home.md): which piece for which need.
+- [docs/wiki/Usage.md](docs/wiki/Usage.md): Server, templates, fingerprints, goose, several templates, the embedded server's settings.
+- [docs/wiki/Launcher.md](docs/wiki/Launcher.md): one server per test run.
+- [docs/wiki/Test-Cache.md](docs/wiki/Test-Cache.md): the inputs go test hashes and why they stay stable.
+- [docs/wiki/Migrating.md](docs/wiki/Migrating.md): from a copied internal/postgrestest, measurements (start, cold start, per test, jobs before and after).
+- [docs/wiki/Gotchas.md](docs/wiki/Gotchas.md): the rules that are easy to get wrong.
+- [docs/design.md](docs/design.md): the design, decisions P1 onwards.
