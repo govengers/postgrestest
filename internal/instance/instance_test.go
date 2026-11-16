@@ -27,6 +27,7 @@ func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
 func TestStableServerKeepsItsURLAndReleasesItsDirectory(t *testing.T) {
 	defaultState, err := DefaultStateDirectory()
 	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(defaultState, 0o700)) // Start creates it; a fresh CI runner has none
 	binaries, err := unpackedBinaries(t.Context(), defaultState)
 	require.NoError(t, err)
 	state, err := os.MkdirTemp("/tmp", "postgrestest test-") //nolint:usetesting // t.TempDir is too long a path for a Unix socket on macOS
