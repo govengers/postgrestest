@@ -67,21 +67,27 @@ func (s *Server) createDatabase(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := cloneDatabase(ctx, s.cluster.administration, name, template); err != nil {
+	if err := s.cluster.inSlot(ctx, func() error {
+		return cloneDatabase(ctx, s.cluster.administration, name, template)
+	}); err != nil {
 		return "", err
 	}
 	return name, nil
 }
 
-// ensureTemplate starts the server and builds the template once; parallel tests wait for it.
+// ensureTemplate starts the server and builds the template once; parallel tests wait for it. A
+// failed build fails every later test at once, unless it failed because its test ended.
 func (s *Server) ensureTemplate(ctx context.Context) (string, error) {
 	if err := s.cluster.start(ctx); err != nil {
 		return "", err
 	}
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	if s.template != "" {
-		return s.template, nil
+	if s.template != "" || s.templateError != nil {
+		return s.template, s.templateError
+	}
+	if s.scope == "" {
+		s.scope = packageScope()
 	}
 	name, err := s.templateName()
 	if err != nil {
@@ -90,6 +96,9 @@ func (s *Server) ensureTemplate(ctx context.Context) (string, error) {
 	if err := s.underBuildLock(ctx, func(connection *pgxpool.Conn) error {
 		return s.prepareTemplate(ctx, connection, name)
 	}); err != nil {
+		if ctx.Err() == nil {
+			s.templateError = err
+		}
 		return "", err
 	}
 	if s.fingerprint == "" {
@@ -135,34 +144,32 @@ func (s *Server) underBuildLock(ctx context.Context, build func(connection *pgxp
 	return buildError
 }
 
-// buildTemplate creates the template unless the server has it. It builds under a scratch name
-// and renames it at the end, so no run ever copies a half-migrated template.
+// buildTemplate creates the template unless the server has it. It builds and marks it under a
+// scratch name and renames it last, so the name only ever stands for a finished template.
 func (s *Server) buildTemplate(ctx context.Context, connection *pgxpool.Conn, name string) error {
 	if exists, err := databaseExists(ctx, connection, name); err != nil || exists {
 		return err
 	}
 	scratch := s.name(buildSuffix)
-	for _, statement := range []string{
-		"DROP DATABASE IF EXISTS " + identifier(scratch) + " WITH (FORCE)", // left by a builder that died
-		"CREATE DATABASE " + identifier(scratch),
-	} {
-		if _, err := connection.Exec(ctx, statement); err != nil {
-			return fmt.Errorf("create the template: %w", err)
-		}
+	if err := dropTemplate(ctx, connection, scratch); err != nil { // left by a builder that died
+		return fmt.Errorf("create the template: %w", err)
+	}
+	if _, err := connection.Exec(ctx, "CREATE DATABASE "+identifier(scratch)); err != nil {
+		return fmt.Errorf("create the template: %w", err)
 	}
 	if err := s.runMigrate(ctx, scratch); err != nil {
 		return errors.Join(err, dropDatabase(ctx, connection, scratch))
+	}
+	// IS_TEMPLATE keeps it from being dropped by accident, ALLOW_CONNECTIONS false keeps sessions
+	// out that would make every copy fail
+	if _, err := connection.Exec(ctx, "ALTER DATABASE "+identifier(scratch)+" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false"); err != nil {
+		return errors.Join(fmt.Errorf("mark the template: %w", err), dropTemplate(ctx, connection, scratch))
 	}
 	if _, err := connection.Exec(ctx, "ALTER DATABASE "+identifier(scratch)+" RENAME TO "+identifier(name)); err != nil {
 		if hasCode(err, objectInUse) {
 			err = errors.New("the template still has a session after Migrate: close every connection Migrate opens")
 		}
-		return errors.Join(fmt.Errorf("publish the template: %w", err), dropDatabase(ctx, connection, scratch))
-	}
-	// IS_TEMPLATE keeps it from being dropped by accident, ALLOW_CONNECTIONS false keeps sessions
-	// out that would make every copy fail
-	if _, err := connection.Exec(ctx, "ALTER DATABASE "+identifier(name)+" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false"); err != nil {
-		return fmt.Errorf("mark the template: %w", err)
+		return errors.Join(fmt.Errorf("publish the template: %w", err), dropTemplate(ctx, connection, scratch))
 	}
 	return nil
 }

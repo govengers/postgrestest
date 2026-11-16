@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,11 +24,17 @@ import (
 // launcher command cmd/postgrestest sets it for every test binary of one run.
 const EnvironmentVariable = "POSTGRESTEST_URL"
 
-// cleanupTimeout bounds the drop of a test's database after the test.
+// cleanupTimeout bounds the drop of a test's database after the test, from the moment the
+// statement may run.
 const cleanupTimeout = 30 * time.Second
 
-// ErrClosed is returned, through the test's failure, by a Server used after Close.
-var ErrClosed = errors.New("the server is closed")
+// concurrentStatements bounds the CREATE DATABASE and DROP DATABASE statements one test binary
+// runs at a time. Each forces checkpoints; dozens at once from the parallel tests of several
+// packages slow a server to a fraction of its rate one after another, and drops then time out.
+const concurrentStatements = 2
+
+// errClosed fails the tests that ask a Server for a database after Close.
+var errClosed = errors.New("the server is closed")
 
 // Options configure a Server. The zero value gives every test an empty database.
 type Options struct {
@@ -50,15 +57,17 @@ type Server struct {
 	cluster     *cluster
 	migrate     func(ctx context.Context, connection *pgx.Conn) error
 	fingerprint string
-	scope       string // identifies the package on a shared server; part of every database name
 
-	mutex    sync.Mutex
-	template string // the built template, empty until the first Database
+	mutex         sync.Mutex
+	scope         string // identifies the package on a shared server; part of every database name
+	template      string // the built template, empty until the first Database
+	templateError error  // a failed build, which every later Database returns
 }
 
 // cluster is the PostgreSQL the Servers of one test binary share.
 type cluster struct {
-	address string // overrides POSTGRESTEST_URL; set by this package's tests only
+	address    string        // overrides POSTGRESTEST_URL; set by this package's tests only
+	statements chan struct{} // the slots of concurrentStatements
 
 	mutex            sync.Mutex
 	started          bool
@@ -82,7 +91,11 @@ type cluster struct {
 //
 //	func TestMain(m *testing.M) { goleak.VerifyTestMain(postgres.Main(m)) }
 func New(options *Options) *Server {
-	return newServer(&cluster{}, options)
+	return newServer(newCluster(""), options)
+}
+
+func newCluster(address string) *cluster {
+	return &cluster{address: address, statements: make(chan struct{}, concurrentStatements)}
 }
 
 // WithTemplate returns a Server on the same PostgreSQL whose test databases copy another template,
@@ -96,7 +109,7 @@ func newServer(shared *cluster, options *Options) *Server {
 	if options == nil {
 		options = &Options{}
 	}
-	return &Server{cluster: shared, migrate: options.Migrate, fingerprint: options.Fingerprint, scope: packageScope()}
+	return &Server{cluster: shared, migrate: options.Migrate, fingerprint: options.Fingerprint}
 }
 
 // packageScope is a digest of the working directory, which go test sets to the package's
@@ -149,9 +162,7 @@ func (s *Server) Database(tb testing.TB) string {
 		tb.Fatalf("postgrestest: %v", err)
 	}
 	tb.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-		defer cancel()
-		if err := dropDatabase(ctx, s.cluster.administration, name); err != nil {
+		if err := s.cluster.dropDatabase(name); err != nil {
 			tb.Errorf("postgrestest: %v", err)
 		}
 	})
@@ -174,7 +185,7 @@ func (s *Server) Pool(tb testing.TB) *pgxpool.Pool {
 // Close drops the templates built for this process only, closes the server's connections and
 // stops the embedded server, for this Server and every one that shares its PostgreSQL through
 // WithTemplate. Close of a Server that never started does nothing. After Close, Database fails the
-// test with ErrClosed.
+// test.
 func (s *Server) Close() error {
 	return s.cluster.close()
 }
@@ -213,7 +224,7 @@ func (c *cluster) start(ctx context.Context) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	if c.closed {
-		return ErrClosed
+		return errClosed
 	}
 	if c.started {
 		return c.startError
@@ -262,6 +273,28 @@ func (c *cluster) stopEmbedded() error {
 	return c.embedded.Stop()
 }
 
+// inSlot runs statement once one of the concurrentStatements slots is free, waiting at most until
+// ctx ends.
+func (c *cluster) inSlot(ctx context.Context, statement func() error) error {
+	select {
+	case c.statements <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("wait for the server: %w", context.Cause(ctx))
+	}
+	defer func() { <-c.statements }()
+	return statement()
+}
+
+// dropDatabase drops a test's database; its timeout starts when the statement may run, not
+// while it waits for a slot behind the drops of other tests.
+func (c *cluster) dropDatabase(name string) error {
+	return c.inSlot(context.Background(), func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		return dropDatabase(ctx, c.administration, name)
+	})
+}
+
 // addProcessTemplate records a template close drops.
 func (c *cluster) addProcessTemplate(name string) {
 	c.mutex.Lock()
@@ -279,9 +312,20 @@ func parseURL(address string) (*url.URL, error) {
 	return parsed, nil
 }
 
+// databaseURL is the base URL on the named database. Query parameters that name a database
+// would win over the path, so they go; the others stay as they were written.
 func (c *cluster) databaseURL(name string) string {
 	address := *c.base
 	address.Path = "/" + name
 	address.RawPath = ""
+	var kept []string
+	for pair := range strings.SplitSeq(address.RawQuery, "&") {
+		key, _, _ := strings.Cut(pair, "=")
+		if key, err := url.QueryUnescape(key); err == nil && (key == "dbname" || key == "database") {
+			continue
+		}
+		kept = append(kept, pair)
+	}
+	address.RawQuery = strings.Join(kept, "&")
 	return address.String()
 }

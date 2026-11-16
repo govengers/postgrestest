@@ -2,6 +2,8 @@ package postgrestest
 
 import (
 	"context"
+	"crypto/rand"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -16,8 +18,8 @@ import (
 
 const schema = `CREATE TABLE tasks (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, title text NOT NULL)`
 
-// primary is the one server of this test binary (TST-002); the tests of attached servers point
-// POSTGRESTEST_URL at it.
+// primary is the one server of this test binary (TST-002); the tests of attached servers point a
+// cluster of their own at its URL.
 var primary = New(&Options{Migrate: Statements(schema), Fingerprint: schema})
 
 func TestMain(m *testing.M) { goleak.VerifyTestMain(primary.Main(m)) }
@@ -93,11 +95,15 @@ func TestTemplateRejectsConnections(t *testing.T) {
 func attached(t *testing.T, scope string, options *Options) *Server {
 	t.Helper()
 	primary.Database(t) // starts the primary
-	server := newServer(&cluster{address: primary.cluster.base.String()}, options)
+	server := newServer(newCluster(primary.cluster.base.String()), options)
 	server.scope = scope
 	t.Cleanup(func() { require.NoError(t, server.Close()) })
 	return server
 }
+
+// unique makes a scope of its own for every run of a test, so -count=2 and a server that outlives
+// the binary do not find the templates of an earlier run.
+func unique(scope string) string { return scope + "_" + rand.Text()[:6] }
 
 // countingMigrate is a Migrate that applies the schema and counts its calls.
 func countingMigrate(calls *atomic.Int32) func(ctx context.Context, connection *pgx.Conn) error {
@@ -111,11 +117,12 @@ func TestAttachedServerReusesTheTemplateOfItsFingerprint(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
 	options := &Options{Migrate: countingMigrate(&calls), Fingerprint: "reuse"}
-	earlier := attached(t, "reuse", options)
+	scope := unique("reuse")
+	earlier := attached(t, scope, options)
 	createAndDrop(t, earlier)
 	require.NoError(t, earlier.Close())
 
-	later := attached(t, "reuse", options)
+	later := attached(t, scope, options)
 	pool, err := pgxpool.New(t.Context(), later.Database(t))
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
@@ -164,7 +171,7 @@ func TestCloseOfATemplateClosesTheSharedPostgreSQL(t *testing.T) {
 	require.NoError(t, other.Close())
 
 	_, err := root.createDatabase(t.Context())
-	require.ErrorIs(t, err, ErrClosed)
+	require.ErrorIs(t, err, errClosed)
 	require.False(t, onServer(t, template), "the template without a fingerprint went with the close")
 }
 
@@ -210,7 +217,8 @@ func TestServersOfOnePackageBuildTheTemplateOnce(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
 	options := &Options{Migrate: countingMigrate(&calls), Fingerprint: "concurrent"}
-	servers := []*Server{attached(t, "concurrent", options), attached(t, "concurrent", options), attached(t, "concurrent", options)}
+	scope := unique("concurrent")
+	servers := []*Server{attached(t, scope, options), attached(t, scope, options), attached(t, scope, options)}
 	errs := make([]error, len(servers))
 	var group sync.WaitGroup
 	for index, server := range servers {
@@ -238,6 +246,88 @@ func TestFailedMigrateFailsTheDatabaseAndLeavesNoTemplate(t *testing.T) {
 
 	require.ErrorContains(t, err, "migrate the template: statements 2")
 	require.Equal(t, 0, count(t, primary.cluster.administration, "SELECT count(*) FROM pg_database WHERE starts_with(datname, $1)", server.name("")))
+}
+
+func TestFailedTemplateBuildFailsEveryLaterDatabaseAtOnce(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	server := attached(t, unique("remembered"), &Options{Migrate: func(context.Context, *pgx.Conn) error {
+		calls.Add(1)
+		return errors.New("broken")
+	}})
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, endedError := server.createDatabase(ended)
+
+	_, first := server.createDatabase(t.Context())
+	_, second := server.createDatabase(t.Context())
+
+	require.Error(t, endedError)
+	require.ErrorContains(t, first, "broken")
+	require.Equal(t, first, second)
+	require.Equal(t, int32(1), calls.Load(), "a build that failed because its test ended is no verdict")
+}
+
+// A builder that died after marking its scratch database leaves a template under the scratch name.
+func TestTemplateBuildDropsAMarkedScratchDatabase(t *testing.T) {
+	t.Parallel()
+	server := attached(t, unique("scratch"), &Options{Migrate: Statements(schema), Fingerprint: "scratch"})
+	scratch := identifier(server.name(buildSuffix))
+	for _, statement := range []string{"CREATE DATABASE " + scratch, "ALTER DATABASE " + scratch + " WITH IS_TEMPLATE true ALLOW_CONNECTIONS false"} {
+		_, err := primary.cluster.administration.Exec(t.Context(), statement)
+		require.NoError(t, err)
+	}
+
+	createAndDrop(t, server)
+
+	require.False(t, onServer(t, server.name(buildSuffix)))
+	require.True(t, onServer(t, server.template))
+}
+
+func TestCopiesWaitForAFreeSlot(t *testing.T) {
+	t.Parallel()
+	server := attached(t, unique("slots"), nil)
+	createAndDrop(t, server) // starts the cluster and builds the template
+	for range concurrentStatements {
+		server.cluster.statements <- struct{}{}
+	}
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := server.createDatabase(ended)
+	for range concurrentStatements {
+		<-server.cluster.statements
+	}
+
+	require.ErrorContains(t, err, "wait for the server")
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 0, count(t, primary.cluster.administration, "SELECT count(*) FROM pg_database WHERE starts_with(datname, $1)", server.name(databaseKind)))
+}
+
+func TestDatabaseURLNamesOnlyTheDatabase(t *testing.T) {
+	t.Parallel()
+	base, err := parseURL("postgres://postgres@/postgres?dbname=postgres&host=/a+b%20c&database=postgres&sslmode=disable")
+	require.NoError(t, err)
+
+	address := (&cluster{base: base}).databaseURL("postgrestest_x")
+
+	require.Equal(t, "postgres://postgres@/postgrestest_x?host=/a+b%20c&sslmode=disable", address)
+	config, err := pgx.ParseConfig(address)
+	require.NoError(t, err)
+	require.Equal(t, "postgrestest_x", config.Database)
+	require.Equal(t, "/a+b c", config.Host)
+}
+
+// New reads nothing (LIB-004): the scope comes from the working directory of the first Database.
+func TestNewReadsNothingBeforeTheFirstDatabase(t *testing.T) {
+	primary.Database(t) // starts the primary
+	server := newServer(newCluster(primary.cluster.base.String()), &Options{Migrate: Statements(schema)})
+	t.Cleanup(func() { require.NoError(t, server.Close()) })
+	t.Chdir(t.TempDir())
+
+	createAndDrop(t, server)
+
+	require.Equal(t, packageScope(), server.scope)
 }
 
 func TestMigrateMustCloseWhatItOpens(t *testing.T) {
@@ -268,7 +358,7 @@ func TestEnvironmentVariableMustBeAPostgresURL(t *testing.T) {
 
 func TestUnreachableServerFailsEveryDatabase(t *testing.T) {
 	t.Parallel()
-	server := newServer(&cluster{address: "postgres://postgres@/postgres?host=/nonexistent-postgrestest&connect_timeout=1"}, nil)
+	server := newServer(newCluster("postgres://postgres@/postgres?host=/nonexistent-postgrestest&connect_timeout=1"), nil)
 
 	_, first := server.createDatabase(t.Context())
 	_, second := server.createDatabase(t.Context())
@@ -284,7 +374,7 @@ func TestClosedServerFails(t *testing.T) {
 
 	_, err := server.createDatabase(t.Context())
 
-	require.ErrorIs(t, err, ErrClosed)
+	require.ErrorIs(t, err, errClosed)
 	require.NoError(t, server.Close())
 }
 
@@ -297,7 +387,7 @@ func TestMainClosesTheServerAfterTheTests(t *testing.T) {
 
 	require.Equal(t, 3, code)
 	_, err := server.createDatabase(t.Context())
-	require.ErrorIs(t, err, ErrClosed)
+	require.ErrorIs(t, err, errClosed)
 }
 
 // createAndDrop copies the template once, for tests that close the server before they end.
