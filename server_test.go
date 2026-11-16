@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -323,11 +324,21 @@ func TestNewReadsNothingBeforeTheFirstDatabase(t *testing.T) {
 	primary.Database(t) // starts the primary
 	server := newServer(newCluster(primary.cluster.base.String()), &Options{Migrate: Statements(schema)})
 	t.Cleanup(func() { require.NoError(t, server.Close()) })
-	t.Chdir(t.TempDir())
+	chdir(t, t.TempDir())
 
 	createAndDrop(t, server)
 
 	require.Equal(t, packageScope(), server.scope)
+}
+
+// chdir is t.Chdir without its read of PWD, which the test log would record: go test sets PWD to
+// the directory it was started from, so every other start directory would miss the cache.
+func chdir(t *testing.T, directory string) {
+	t.Helper()
+	previous, err := syscall.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, syscall.Chdir(directory))
+	t.Cleanup(func() { require.NoError(t, syscall.Chdir(previous)) })
 }
 
 func TestMigrateMustCloseWhatItOpens(t *testing.T) {

@@ -138,7 +138,8 @@ func (i *Instance) URL() string {
 // Directory is the server's directory.
 func (i *Instance) Directory() string { return i.directory }
 
-// Stop stops the server at once, removes its directory and releases it.
+// Stop stops the server at once, removes its directory (empties it when it is a stable one) and
+// releases it.
 func (i *Instance) Stop() error {
 	var stopError error
 	if _, err := os.Stat(filepath.Join(i.directory, dataName, "postmaster.pid")); err == nil {

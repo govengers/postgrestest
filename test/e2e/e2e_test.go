@@ -7,6 +7,8 @@ package e2e
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/url"
 	"os"
@@ -20,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/govengers/postgrestest/internal/instance"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -177,7 +180,22 @@ func launcherCommand(t *testing.T, directory string, extra []string, arguments .
 	command := exec.CommandContext(context.Background(), launcher(t), arguments...)
 	command.Dir = directory
 	command.Env = environment(extra)
+	removeStableDirectory(t, directory)
 	return command
+}
+
+// removeStableDirectory removes, after the test and its launchers, the run- directory the launcher
+// names after directory: nothing else does (P9), and a temporary checkout never runs again.
+func removeStableDirectory(t *testing.T, directory string) {
+	t.Helper()
+	state, err := instance.DefaultStateDirectory()
+	require.NoError(t, err)
+	physical, err := filepath.EvalSymlinks(directory) // the launcher names the directory the kernel reports
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		digest := sha256.Sum256([]byte(physical))
+		require.NoError(t, os.RemoveAll(filepath.Join(state, "run-"+hex.EncodeToString(digest[:8]))))
+	})
 }
 
 func exitCode(t *testing.T, err error) int {

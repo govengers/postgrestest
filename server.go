@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -115,8 +116,10 @@ func newServer(shared *cluster, options *Options) *Server {
 
 // packageScope is a digest of the working directory, which go test sets to the package's
 // directory: test binaries of other packages and other checkouts on one shared server keep apart.
+// syscall.Getwd, not os.Getwd: os.Getwd reads PWD, which the test log would record as an input,
+// and go test sets it to the directory it was started from.
 func packageScope() string {
-	directory, _ := os.Getwd() // an unknown directory still gives one scope for the process
+	directory, _ := syscall.Getwd() // an unknown directory still gives one scope for the process
 	digest := sha256.Sum256([]byte(directory))
 	return hex.EncodeToString(digest[:6])
 }

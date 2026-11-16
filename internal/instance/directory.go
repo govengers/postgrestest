@@ -35,6 +35,9 @@ func claim(state, stable string) (*Instance, error) {
 // claimStable returns nil without an error when another process holds the directory. Nothing
 // removes a stable directory or its lock file (release and Sweep only empty it), so the lock of
 // the file is the lock of the directory.
+//
+// shortcut: so one empty directory per checkout directory ever launched stays and every Sweep lists
+// it; remove those whose checkout is gone when they pile up.
 func claimStable(directory string) (*Instance, error) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, fmt.Errorf("create the server directory: %w", err)
